@@ -8,6 +8,8 @@ import serial.tools.list_ports
 import csv
 import random
 from collections import Counter
+import threading
+from process_payment import PaymentProcessor
 
 # ======== CONFIGURATION ========
 
@@ -30,7 +32,7 @@ if not os.path.exists(csv_file):
     try:
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Plate Number', 'Payment Status', 'Timestamp'])
+            writer.writerow(['Plate Number', 'Payment Status', 'Timestamp', 'Amount'])
     except Exception as e:
         print(f"[ERROR] Failed to create CSV file: {e}")
         exit(1)
@@ -54,6 +56,15 @@ try:
         print("[WARNING] Arduino not detected. Gate control will be simulated.")
 except Exception as e:
     print(f"[ERROR] Arduino connection failed: {e}")
+
+
+
+payment_processor = PaymentProcessor()
+payment_thread = threading.Thread(target=payment_processor.run)
+payment_thread.daemon = True
+payment_thread.start()
+
+
 
 # ======== ULTRASONIC SENSOR MOCK ========
 # For testing, always return "vehicle present" distance
@@ -318,4 +329,6 @@ finally:
     if arduino is not None:
         arduino.close()
     cv2.destroyAllWindows()
+    payment_processor.stop()
     print("[SYSTEM] Cleanup complete")
+
