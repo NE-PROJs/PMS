@@ -1,150 +1,158 @@
+import csv
 import serial
 import time
-import csv
+import serial.tools.list_ports
+import platform
 from datetime import datetime
 
-# Configure the serial port (adjust 'COM14' to your Arduino's port)
-ser = serial.Serial('COM4', 9600, timeout=1)
-time.sleep(2)  # Wait for serial to initialize
+CSV_FILE = 'plates_log.csv'
+RATE_PER_MINUTE = 5  # Amount charged per minute
 
-def print_boxed_message(message, border_char="=", width=50):
-    """Helper function to print a message in a boxed format."""
-    border = border_char * width
-    padding = " " * ((width - len(message) - 2) // 2)
-    print(border)
-    print(f"|{padding}{message}{padding}{' ' if len(message) % 2 else ''}|")
-    print(border)
+def detect_arduino_port():
+    ports = list(serial.tools.list_ports.comports())
+    system = platform.system()
+    for port in ports:
+        desc = port.description.lower()
+        if system == "Windows" and "com12" in port.device.lower():
+            return port.device
+        elif system == "Linux" and ("ttyusb" in port.device.lower() or "ttyacm" in port.device.lower()):
+            return port.device
+        elif system == "Darwin" and ("usbmodem" in port.device.lower() or "usbserial" in port.device.lower()):
+            return port.device
+    return None
 
-def get_timestamp():
-    """Return the current timestamp in a formatted string."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def read_last_unpaid_entry(plate):
-    """Read the last unpaid entry (Payment Status = 0) for a given plate from plates_log.csv."""
+def parse_arduino_data(line):
     try:
-        with open('plates_log.csv', 'r') as file:
-            reader = csv.DictReader(file)
-            entries = [row for row in reader if row['Plate Number'] == plate and row['Payment Status'] == '0']
-            if not entries:
-                return None
-            return entries[-1]  # Return the last unpaid entry
-    except FileNotFoundError:
-        print_boxed_message("Error: File Not Found", "!")
-        print(f"[{get_timestamp()}] plates_log.csv not found. Creating a new one.\n")
-        with open('plates_log.csv', 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Plate Number', 'Payment Status', 'Timestamp', 'Payment Timestamp'])
-        return None
-    except Exception as e:
-        print_boxed_message("Error: CSV Read Failed", "!")
-        print(f"[{get_timestamp()}] {e}\n")
-        return None
+        parts = line.strip().split(',')
+        print(f"[ARDUINO] Parsed parts: {parts}")
+        if len(parts) != 2:
+            return None, None
+        plate = parts[0].strip().upper()
+        balance_str = ''.join(c for c in parts[1] if c.isdigit())
+        print(f"[ARDUINO] Cleaned balance: {balance_str}")
+        if balance_str:
+            balance = int(balance_str)
+            return plate, balance
+        return None, None
+    except ValueError as e:
+        print(f"[ERROR] Value error in parsing: {e}")
+        return None, None
 
-def update_payment_status(plate, entry_timestamp):
-    """Update the Payment Status to 1 and log the payment timestamp."""
+def process_payment(plate, balance, ser):
     try:
-        rows = []
-        payment_time = get_timestamp()  # Exact time of payment
-        with open('plates_log.csv', 'r') as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                if row['Plate Number'] == plate and row['Timestamp'] == entry_timestamp and row['Payment Status'] == '0':
-                    row['Payment Status'] = '1'
-                    row['Payment Timestamp'] = payment_time
-                rows.append(row)
-        
-        with open('plates_log.csv', 'w', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=['Plate Number', 'Payment Status', 'Timestamp', 'Payment Timestamp'])
-            writer.writeheader()
-            writer.writerows(rows)
-        return payment_time
+        with open(CSV_FILE, 'r') as f:
+            rows = list(csv.reader(f))
+            print(f"[DEBUG] CSV Contents: {rows}")
+        if not rows:
+            print("[ERROR] CSV is empty")
+            return
+
+        header = ['Plate Number', 'Payment Status', 'Timestamp']
+        if rows[0] != header:
+            print("[ERROR] CSV header missing or incorrect. Expected:", header)
+            rows.insert(0, header)
+        entries = rows[1:] if len(rows) > 1 else []
+        found = False
+
+        for i, row in enumerate(entries):
+            print(f"[DEBUG] Checking row: {row}")
+            if row[0].strip() == plate and row[1].strip() == '0':
+                found = True
+                try:
+                    entry_time_str = row[2]
+                    entry_time = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S')
+                    exit_time = datetime.now()
+                    minutes_spent = int((exit_time - entry_time).total_seconds() / 60) + 1
+                    amount_due = minutes_spent * RATE_PER_MINUTE
+
+                    while len(entries[i]) < 4:
+                        entries[i].append('')
+                    entries[i][3] = exit_time.strftime('%Y-%m-%d %H:%M:%S')
+
+                    if balance < amount_due:
+                        print(f"[PAYMENT] Insufficient balance: {balance} < {amount_due}")
+                        ser.write(b'I\n')
+                        return
+                    else:
+                        new_balance = balance - amount_due
+                        print("[WAIT] Waiting for Arduino to be READY...")
+                        start_time = time.time()
+                        while True:
+                            if ser.in_waiting:
+                                arduino_response = ser.readline().decode().strip()
+                                print(f"[ARDUINO] {arduino_response}")
+                                if arduino_response == "READY":
+                                    break
+                            if time.time() - start_time > 10:
+                                print("[ERROR] Timeout waiting for Arduino READY")
+                                return
+                            time.sleep(0.1)
+
+                        ser.write(f"{new_balance}\r\n".encode())
+                        print(f"[PAYMENT] Sent new balance {new_balance}")
+
+                        start_time = time.time()
+                        print("[WAIT] Waiting for Arduino confirmation...")
+                        while True:
+                            if ser.in_waiting:
+                                confirm = ser.readline().decode().strip()
+                                print(f"[ARDUINO] {confirm}")
+                                if "DONE" in confirm:
+                                    print("[ARDUINO] Write confirmed")
+                                    entries[i][1] = '1'
+                                    break
+                            if time.time() - start_time > 10:
+                                print("[ERROR] Timeout waiting for confirmation")
+                                break
+                            time.sleep(0.1)
+                except ValueError as e:
+                    print(f"[ERROR] Invalid timestamp format: {e}")
+                    return
+                break
+
+        if not found:
+            print("[PAYMENT] Plate not found or already paid.")
+            return
+
+        with open(CSV_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(entries)
+
     except Exception as e:
-        print_boxed_message("Error: CSV Update Failed", "!")
-        print(f"[{get_timestamp()}] {e}\n")
-        return None
+        print(f"[ERROR] Payment processing failed: {e}")
 
-try:
-    print_boxed_message("Python Parking System Ready", "=")
-    print(f"[{get_timestamp()}] Waiting for Arduino data...\n")
+def main():
+    port = detect_arduino_port()
+    if not port:
+        print("[ERROR] Arduino not found")
+        return
 
-    while True:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8').strip()
-            if line.startswith("DATA:"):
-                # Parse the data
-                plate, cash = line[5:].split(',')
-                cash = int(cash)
+    try:
+        ser = serial.Serial(port, 9600, timeout=2)
+        print(f"[CONNECTED] Listening on {port}")
+        time.sleep(2)
+        ser.reset_input_buffer()
 
-                # Display received data
-                print_boxed_message("Data Received from Arduino", "-")
-                print(f"[{get_timestamp()}] Details:")
-                print(f"  License Plate: {plate}")
-                print(f"  Current Balance: {cash} units\n")
+        while True:
+            try:
+                if ser.in_waiting:
+                    line = ser.readline().decode().strip()
+                    if line and ',' in line:
+                        print(f"[SERIAL] Received: {line}")
+                        plate, balance = parse_arduino_data(line)
+                        if plate and balance is not None:
+                            process_payment(plate, balance, ser)
+            except serial.SerialException as e:
+                print(f"[ERROR] Serial communication failed: {e}")
+                time.sleep(1)
+            time.sleep(0.1)
 
-                # Check if cash is more than 200
-                if cash <= 200:
-                    print_boxed_message("Error: Insufficient Balance", "!")
-                    print(f"[{get_timestamp()}] Balance ({cash} units) must be > 200 units.\n")
-                    continue
+    except KeyboardInterrupt:
+        print("[EXIT] Program terminated")
+    finally:
+        if 'ser' in locals():
+            ser.close()
 
-                # Read the last unpaid entry for the plate
-                last_entry = read_last_unpaid_entry(plate)
-                if last_entry is None:
-                    print_boxed_message("Warning: No Unpaid Entry Found", "!")
-                    print(f"[{get_timestamp()}] No unpaid entry for plate {plate}. Assuming 0 hours.\n")
-                    hours = 0
-                else:
-                    entry_time = datetime.strptime(last_entry['Timestamp'], "%Y-%m-%d %H:%M:%S")
-                    current_time = datetime.now()
-                    time_diff = current_time - entry_time
-                    hours = time_diff.total_seconds() / 3600  # Convert to hours
-
-                # Calculate charge (100 units per 30 min after first 30 min)
-                minutes = hours * 60
-                charge = 0
-                if minutes > 30:
-                    charge = ((minutes - 30 + 29) // 30) * 100
-
-                if charge > cash:
-                    print_boxed_message("Error: Charge Exceeds Balance", "!")
-                    print(f"[{get_timestamp()}] Charge ({charge} units) exceeds balance ({cash} units).\n")
-                    continue
-
-                # Send charge to Arduino
-                ser.write(f"CHARGE:{charge}\n".encode())
-                print_boxed_message("Data Sent to Arduino", "-")
-                print(f"[{get_timestamp()}] Transaction Details:")
-                print(f"  License Plate: {plate}")
-                print(f"  Parking Duration: {hours:.2f} hours")
-                print(f"  Charge Amount: {charge} units\n")
-
-                # Wait for DONE signal
-                response = ser.readline().decode('utf-8').strip()
-                if response == "DONE":
-                    if last_entry:
-                        payment_time = update_payment_status(plate, last_entry['Timestamp'])
-                        if payment_time:
-                            print_boxed_message("Payment Processed", "-")
-                            print(f"[{get_timestamp()}] Payment Details:")
-                            print(f"  Payment Timestamp: {payment_time}")
-                            print(f"  Updated Balance: {cash - charge} units\n")
-                    print_boxed_message("Transaction Successful", "=")
-                    print(f"[{get_timestamp()}] Gate is opening...\n")
-                else:
-                    print_boxed_message("Error: Arduino Response", "!")
-                    print(f"[{get_timestamp()}] Unexpected response: {response}\n")
-
-        time.sleep(0.1)  # Small delay to prevent overwhelming the loop
-
-except KeyboardInterrupt:
-    print("\n" + "=" * 50)
-    print(f"[{get_timestamp()}] Program terminated by user.")
-    print("=" * 50)
-    ser.close()
-except Exception as e:
-    print("\n" + "=" * 50)
-    print(f"[{get_timestamp()}] An error occurred: {e}")
-    print("=" * 50)
-    ser.close()
-finally:
-    ser.close()
+if __name__ == "__main__":
+    main()

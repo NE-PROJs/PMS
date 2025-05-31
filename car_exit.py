@@ -1,6 +1,7 @@
 import cv2
 from ultralytics import YOLO
 import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 import os
 import time
 import serial
@@ -10,7 +11,7 @@ from collections import Counter
 import random
 
 # Load YOLOv8 model (same model as entry)
-model = YOLO('/opt/homebrew/runs/detect/train4/weights/best.pt')
+model = YOLO('best.pt')
 
 # CSV log file
 csv_file = 'plates_log.csv'
@@ -19,7 +20,7 @@ csv_file = 'plates_log.csv'
 def detect_arduino_port():
     ports = list(serial.tools.list_ports.comports())
     for port in ports:
-        if "usbmodem" in port.device or "wchusbmodem" in port.device:
+        if "Arduino" in port.description or "COM9" in port.description or "USB-SERIAL" in port.description:
             return port.device
     return None
 
@@ -34,7 +35,7 @@ else:
 
 # ===== Ultrasonic Sensor (mock for now) =====
 def mock_ultrasonic_distance():
-    return random.choice([random.randint(10, 40)] + [random.randint(60, 150)] * 10)
+    return random.choice([random.randint(10, 40)])
 
 # ===== Check payment status in CSV =====
 def is_payment_complete(plate_number):
